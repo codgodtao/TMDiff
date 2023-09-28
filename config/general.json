@@ -1,0 +1,68 @@
+{
+  "name": "general_training",
+  "info": "using QB only",
+  "phase": "train",
+  "distributed": true,
+  // train or val
+  "gpu_ids": [
+    1,2,3
+  ],
+  "path": {
+    //set the path
+    "log": "logs",
+    "tb_logger": "tb_logger",
+    "results": "results",
+    "checkpoint": "checkpoint",
+    "resume": null
+  },
+  "datasets": {
+    "train": {
+      "dataroot": "/data/qlt/pancollection/training_data/train_qb_data.h5",
+      "batch_size": 24,
+      "num_workers": 8,
+      "use_shuffle": true,
+      "data_len": -1
+    },
+    "val": {
+      "dataroot": "/data/qlt/pancollection/test_data/QB/test_qb_data_RR.h5",
+      "data_len": -1
+    }
+  },
+  "model": {
+    "beta_schedule": {
+      // use munual beta_schedule for acceleration
+      "train": {
+        "schedule": "cosine",
+        "n_timestep": 1000
+      },
+      "val": {
+        "schedule": "cosine",
+        "n_timestep": 1000
+      }
+    },
+    "init_type": "kaiming",
+    "unet": {
+      "channel_multiplier": [
+        16,
+        32,
+        64,
+        128
+      ]
+    },
+    "diffusion": {
+      "loss_type": "l1"
+    }
+  },
+  "train": {
+    "n_epochs": 1000,
+    "val_freq": 100,
+    "save_checkpoint_freq": 100,
+    "print_freq": 10,
+    "optimizer": {
+      "lr": 3e-4
+    }
+  }
+}
+
+
+

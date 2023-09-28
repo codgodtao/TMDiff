@@ -1,0 +1,56 @@
+{
+  "name": "first_attemp",
+  "info": "",
+  "phase": "val",
+  // train or val
+  "gpu_ids": [
+    0
+  ],
+  "path": {
+    //set the path
+    "log": "logs",
+    "tb_logger": "tb_logger",
+    "results": "results",
+    "checkpoint": "checkpoint"
+  },
+  "datasets": {
+    "val": {
+      "dataroot": "E:\\UDL\\Data\\pansharpening\\test_data\\QB\\test_qb_data_RR.h5",
+      "data_len": -1
+    }
+  },
+  "model": {
+    "which_model_G": "easy",
+    "beta_schedule": {
+      // use munual beta_schedule for acceleration
+      "train": {
+        "schedule": "cosine",
+        "n_timestep": 1000
+      },
+      "val": {
+        "schedule": "cosine",
+        "n_timestep": 1000
+      }
+    },
+    "diffusion": {
+      "image_size": 256,
+      "conditional": true,
+      "loss_type": "l2"
+    }
+  },
+  "model_fu": {
+    "spectral_num": 4
+  },
+  "train": {
+    "n_epochs": 1000,
+    "val_freq": 100,
+    "save_checkpoint_freq": 100,
+    "print_freq": 1,
+    "optimizer": {
+      "lr": 3e-4
+    }
+  }
+}
+
+
+
