@@ -44,15 +44,12 @@ def tensor2img_4C(tensor, out_type=np.uint8, min_max=(-1, 1)):
     return img_np.astype(out_type)
 
 
-
 def save_img(img, img_path, mode='RGB'):
     # if mode == 'gray':
     #     cv2.imwrite(img_path, img)
     # else:
     cv2.imwrite(img_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
     # cv2.imwrite(img_path, img)
-
-
 
 
 # numpy version
@@ -69,7 +66,7 @@ def SSIM_numpy(x_true, x_pred, data_range, sewar=False):
     if sewar:
         return sewar_api.ssim(x_true, x_pred, MAX=data_range)[0]
 
-    return structural_similarity(x_true, x_pred, data_range=data_range, multichannel=True)
+    return structural_similarity(x_true, x_pred, data_range=data_range, channel_axis=-1)
 
 
 def MPSNR_numpy(x_true, x_pred, data_range):
@@ -200,7 +197,7 @@ def Q4_numpy(ms, ps):
         Sc[:, i] = product(d1[:, i], d2[:, i])
     C = np.mean(Sc, axis=1)
     Q4 = 4 * np.sqrt(np.sum(m1 * m1) * np.sum(m2 * m2) * np.sum(C * C)) / (s1 + s2) / (
-                np.sum(m1 * m1) + np.sum(m2 * m2))
+            np.sum(m1 * m1) + np.sum(m2 * m2))
     return Q4
 
 
@@ -461,7 +458,7 @@ def QIndex_torch(a, b, eps=1e-8):
     var_a = E_a2 - E_a * E_a
     var_b = E_b2 - E_b * E_b
     cov_ab = E_ab - E_a * E_b
-    return torch.mean(4 * cov_ab * E_a * E_b / ( (var_a + var_b) * (E_a ** 2 + E_b ** 2) + eps) )
+    return torch.mean(4 * cov_ab * E_a * E_b / ((var_a + var_b) * (E_a ** 2 + E_b ** 2) + eps))
 
 
 def D_lambda_torch(l_ms, ps):
@@ -480,7 +477,8 @@ def D_lambda_torch(l_ms, ps):
     for i in range(L):
         for j in range(L):
             if j != i:
-                sum += torch.abs(QIndex_torch(ps[:, i, :, :], ps[:, j, :, :]) - QIndex_torch(l_ms[:, i, :, :], l_ms[:, j, :, :]))
+                sum += torch.abs(
+                    QIndex_torch(ps[:, i, :, :], ps[:, j, :, :]) - QIndex_torch(l_ms[:, i, :, :], l_ms[:, j, :, :]))
     return sum / L / (L - 1)
 
 
@@ -500,5 +498,6 @@ def D_s_torch(l_ms, pan, l_pan, ps):
     L = ps.shape[1]
     sum = torch.Tensor([0]).to(ps.device, dtype=ps.dtype)
     for i in range(L):
-        sum += torch.abs(QIndex_torch(ps[:, i, :, :], pan[:, 0, :, :]) - QIndex_torch(l_ms[:, i, :, :], l_pan[:, 0, :, :]))
+        sum += torch.abs(
+            QIndex_torch(ps[:, i, :, :], pan[:, 0, :, :]) - QIndex_torch(l_ms[:, i, :, :], l_pan[:, 0, :, :]))
     return sum / L

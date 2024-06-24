@@ -14,6 +14,15 @@ import math
 
 from utils.util import get_gaussian_kernel
 
+
+def add_prefix(dct, prefix):
+    return {f'{prefix}/{key}': val for key, val in dct.items()}
+
+
+def dct2str(dct):
+    return str({k: f'{v:.6g}' for k, v in dct.items()})
+
+
 '''
 mav_value = 1023  #  GF:1023  QB:2047
 img = img.astype(np.float32) / mav_value    # 归一化处理  最开始 mav_value = 1023  #  GF:1023  QB:2047

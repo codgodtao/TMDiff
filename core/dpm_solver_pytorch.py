@@ -116,7 +116,7 @@ class NoiseScheduleVP:
             self.cosine_s = 0.008
             self.cosine_beta_max = 999.
             self.cosine_t_max = math.atan(self.cosine_beta_max * (1. + self.cosine_s) / math.pi) * 2. * (
-                        1. + self.cosine_s) / math.pi - self.cosine_s
+                    1. + self.cosine_s) / math.pi - self.cosine_s
             self.cosine_log_alpha_0 = math.log(math.cos(self.cosine_s / (1. + self.cosine_s) * math.pi / 2.))
             self.schedule = schedule
             if schedule == 'cosine':
@@ -176,7 +176,7 @@ class NoiseScheduleVP:
         else:
             log_alpha = -0.5 * torch.logaddexp(-2. * lamb, torch.zeros((1,)).to(lamb))
             t_fn = lambda log_alpha_t: torch.arccos(torch.exp(log_alpha_t + self.cosine_log_alpha_0)) * 2. * (
-                        1. + self.cosine_s) / math.pi - self.cosine_s
+                    1. + self.cosine_s) / math.pi - self.cosine_s
             t = t_fn(log_alpha)
             return t
 
@@ -297,7 +297,7 @@ def model_wrapper(
         t_input = get_model_input_time(t_continuous)
         if cond is None:
             output = model(x, t_input, **model_kwargs)
-        else:
+        else:  # cond分别是zero和MS
             output = model(x, t_input, cond, **model_kwargs)
         if model_type == "noise":
             return output
@@ -339,7 +339,7 @@ def model_wrapper(
             else:
                 x_in = torch.cat([x] * 2)
                 t_in = torch.cat([t_continuous] * 2)
-                c_in = torch.cat([unconditional_condition, condition])
+                c_in = torch.cat([unconditional_condition, condition])  # zeros and MS
                 noise_uncond, noise = noise_pred_fn(x_in, t_in, cond=c_in).chunk(2)
                 return noise_uncond + guidance_scale * (noise - noise_uncond)
 
