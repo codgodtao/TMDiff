@@ -132,6 +132,35 @@ class HyperGeneralModel(nn.Module):
         return to2D(h)  # (b,1,h,w,c)-->(b,c,h,w)
 
 
+def modulated_conv2d(
+        x,  # Input tensor: [batch_size, in_channels, in_height, in_width]
+        w,  # Weight tensor: [out_channels, in_channels, kernel_height, kernel_width]
+        s,  # Style tensor: [batch_size, in_channels]
+        padding=None,  # Padding: int or [padH, padW]
+        bias=None,
+        stride=None,
+        dilation=1
+):
+    """
+    https://github.com/NVlabs/stylegan3/blob/407db86e6fe432540a22515310188288687858fa/training/networks_stylegan3.py
+    """
+    #     with misc.suppress_tracer_warnings(): # this value will be treated as a constant
+    batch_size = int(x.shape[0])
+    out_channels, in_channels, kh, kw = w.shape
+
+    # Modulate weights.
+    w = w.unsqueeze(0)  # [NOIkk]
+    w = (w * s.unsqueeze(1).unsqueeze(3).unsqueeze(4))  # [NOIkk]
+    # Execute as one fused op using grouped convolution.
+    x = x.reshape(1, -1, *x.shape[2:])
+    w = w.reshape(-1, in_channels, kh, kw)
+
+    x = torch.nn.functional.conv2d(input=x, weight=w.to(x.dtype), bias=bias, stride=stride, padding=padding,
+                                   dilation=dilation, groups=batch_size)
+    x = x.reshape(batch_size, -1, *x.shape[2:])
+    return x
+
+
 if __name__ == '__main__':
     import numpy as np
 

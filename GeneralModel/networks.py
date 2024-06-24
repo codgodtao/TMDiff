@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 from torch.nn import init
 
-from GeneralModel import diffusion_general as diffusion, unet_general as unet
+from GeneralModel import diffusion_general as diffusion
+from GeneralModel import clip_unet_general as clip
 
 logger = logging.getLogger('base')
 
@@ -78,11 +79,25 @@ def init_weights(net, init_type='kaiming', scale=1, std=0.02):
 
 def define_General(opt):
     model_opt = opt['model']
-    model = unet.General_Unet(channels=model_opt['unet']['channel_multiplier'])
+    model = clip.AblabtionNet(channels=model_opt['unet']['channel_multiplier'])
     netG = diffusion.GeneralDiffusion(
         denoise_fn=model,  # denoise_fn is as unet, so
         loss_type=model_opt['diffusion']['loss_type'])  # True or False
+    if opt['phase'] == 'train':
+        init_weights(netG, init_type=model_opt['init_type'])
+    if opt['gpu_ids'] and opt['distributed']:
+        assert torch.cuda.is_available()
+        logger.info("distributed_training")
+        netG = nn.DataParallel(netG)
+    return netG
 
+
+def define_General2(opt):
+    model_opt = opt['model']
+    model = clip.AblabtionNetwav(channels=model_opt['unet']['channel_multiplier'])
+    netG = diffusion.GeneralDiffusion2(
+        denoise_fn=model,  # denoise_fn is as unet, so
+        loss_type=model_opt['diffusion']['loss_type'])  # True or False
     if opt['phase'] == 'train':
         init_weights(netG, init_type=model_opt['init_type'])
     if opt['gpu_ids'] and opt['distributed']:
