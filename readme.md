@@ -1,5 +1,1 @@
-M_cycle和M_cycle_full是reduced上和full上的zero-shot pansharpening方法
-M_cycle_full_data是full上所有测试数据一起进行测试的结果
-sr.py实现了supervised pre-training for reduced resolution pansharpening
-而general sharpening也是为了实现supervised joint training
-p(PAN,MS,sensor_prompt_image) = noise in xt
+
