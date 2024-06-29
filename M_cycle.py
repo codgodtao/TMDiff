@@ -115,7 +115,7 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size).type(dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -330,10 +330,12 @@ class DiT(nn.Module):
         y: (N,) tensor of class labels
         """
         MOE_MANAGER.reset_loss()
+        print(x.shape, t.shape)
         x = self.x_embedder(x)  # (N, T, D), where T = H * W * 3C / patch_size ** 3
         t = self.t_embedder(t)  # (N, D)
         l = self.l_embedder(prompts)
         c = t + l
+        print(x.shape,t.shape,l.shape)
         for block in self.blocks:
             x = block(x, c)  # (N, T, D)
         x = self.final_layer(x, c)  # (N, T, patch_size ** 3)
@@ -351,32 +353,25 @@ class DiT(nn.Module):
 #################################################################################
 
 def DiT_S_DEMO(model_clip, **kwargs):
-    return DiT(model_clip=model_clip, depth=6, hidden_size=128, patch_size=4, num_heads=8, **kwargs)
+    return DiT(model_clip=model_clip, depth=6, hidden_size=32, patch_size=4, num_heads=4, **kwargs)
 
 import time
 if __name__ == '__main__':
-    #warp model with huggingface,do model_parallel for inference with multi-gpu
-    device = 'auto'
+    from accelerate import Accelerator
+    accelerator = Accelerator()
+    device = "cuda"
     model_clip, _ = clip.load("ViT-B/32", device=device)  # only one 77 embeding is given, thus we can do this also?
-
     model = DiT_S_DEMO(model_clip).to(device)
-    optim_params = []
-    for name, param in model.named_parameters():
-        # print(name, param.shape)
-        optim_params.append(param)
-    print(sum(p.numel() for p in optim_params) / (1024.0 * 1024.0))
-
-    x = torch.randn((2, 16, 512, 512)).to(device)  # 输入xt,ms,duplicate pan-ms 三部分  输入token比较长，重建只在一部分token上计算loss
-    y = ["this is a test", "this is a test"]
+    model = accelerator.prepare(model)
+    x = torch.randn((1, 16, 512, 512),device= device,dtype=torch.float32) # 输入xt,ms,duplicate pan-ms 三部分  输入token比较长，重建只在一部分token上计算loss
+    y = ["this is a test"]
     y = clip.tokenize(y).to(device)
-
-    time_in = torch.from_numpy(np.random.randint(1, 1000 + 1, size=2)).to(device)
-    t1 = time.time()
+    time_in = torch.from_numpy(np.random.randint(1, 1000 + 1, size=1)).to(device)
     original_tuple = (16, 512, 512)
     shape = (x // 4 for x in original_tuple)
-    output = model(x, time_in, y, shape)
+    with torch.no_grad():
+        output = model(x, time_in, y, shape)
     t2 = time.time()
-    # print(t2 - t1)
     print(output.shape)
 
     # optimizer = optim.Adam(model.parameters(), lr=0.001)
