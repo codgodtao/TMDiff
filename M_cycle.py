@@ -353,7 +353,7 @@ class DiT(nn.Module):
 #################################################################################
 
 def DiT_S_DEMO(model_clip, **kwargs):
-    return DiT(model_clip=model_clip, depth=6, hidden_size=32, patch_size=4, num_heads=4, **kwargs)
+    return DiT(model_clip=model_clip, depth=6, hidden_size=128, patch_size=4, num_heads=8, **kwargs)
 
 import time
 if __name__ == '__main__':
@@ -363,14 +363,14 @@ if __name__ == '__main__':
     model_clip, _ = clip.load("ViT-B/32", device=device)  # only one 77 embeding is given, thus we can do this also?
     model = DiT_S_DEMO(model_clip).to(device)
     model = accelerator.prepare(model)
-    x = torch.randn((1, 16, 512, 512),device= device,dtype=torch.float32) # 输入xt,ms,duplicate pan-ms 三部分  输入token比较长，重建只在一部分token上计算loss
+    x = torch.randn((1, 16, 64, 64),device= device,dtype=torch.float32) # 输入xt,ms,duplicate pan-ms 三部分  输入token比较长，重建只在一部分token上计算loss
     y = ["this is a test"]
     y = clip.tokenize(y).to(device)
     time_in = torch.from_numpy(np.random.randint(1, 1000 + 1, size=1)).to(device)
-    original_tuple = (16, 512, 512)
+    original_tuple = (16, 64, 64)
     shape = (x // 4 for x in original_tuple)
     with torch.no_grad():
-        output = model(x, time_in, y, shape)
+        output ,_= model(x, time_in, y, shape)
     t2 = time.time()
     print(output.shape)
 
