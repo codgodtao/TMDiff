@@ -8,8 +8,8 @@ import numpy as np
 from itertools import repeat
 import collections.abc
 from functools import partial
-from ColossalAI.colossalai.moe import SparseMLP
-from ColossalAI.colossalai.moe.manager import MOE_MANAGER
+from colossalai.moe import SparseMLP
+from colossalai.moe.manager import MOE_MANAGER
 
 
 def modulate(x, shift, scale):
@@ -173,19 +173,17 @@ class DiTBlock(nn.Module):
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        # approx_gelu = lambda: nn.GELU(approximate="tanh")
-        # MLP(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         self.mlp = SparseMLP(
-            num_experts=16,
-            hidden_size=hidden_size,
+            num_experts=8,
+            hidden_size=128,
             intermediate_size=mlp_hidden_dim,
             router_top_k=2,
             router_capacity_factor_train=1.25,
             router_capacity_factor_eval=2.0,
-            router_min_capacity=8,
+            router_min_capacity=4,
             router_noisy_policy=None,
             router_drop_tks=True,
-            # mlp_activation=mlp_hidden_dim,
+            mlp_activation="swiglu",
             mlp_gated=True,
             enable_load_balance=False,
             load_balance_tolerance=0.1,
@@ -202,9 +200,7 @@ class DiTBlock(nn.Module):
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        # x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        print(x.shape) #([1, 4096, 128])
-        print(self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)))
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -256,7 +252,7 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4) #batch num_heads token_num head_dim
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
@@ -271,43 +267,53 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+class  MultiQueryAttention(Attention):
+    r"""
+    https://arxiv.org/pdf/1911.02150.pdf
+    """
+    def __init__(self, word_size: int = 512, embed_dim: int = 64, n_query:int=8) -> None:
+        super().__init__(word_size, embed_dim)
+        self.n_query = n_query
+        self.proj = nn.Parameter(torch.empty(embed_dim * n_query, embed_dim))
+        nn.init.xavier_normal_(self.proj)
+        delattr(self, 'query')
+        self.querys = nn.ModuleList([
+            nn.Linear(in_features=word_size, out_features=embed_dim, bias=True)
+            for _ in range(n_query)
+        ])
+        self.key = nn.Linear(in_features=word_size, out_features=embed_dim, bias=True)
+        self.value = nn.Linear(in_features=word_size, out_features=embed_dim, bias=True)
 
-# class Mlp(nn.Module):
-#     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
-#     """
-#     def __init__(
-#             self,
-#             in_features,
-#             hidden_features=None,
-#             out_features=None,
-#             act_layer=nn.GELU,
-#             norm_layer=None,
-#             bias=True,
-#             drop=0.,
-#             use_conv=False,
-#     ):
-#         super().__init__()
-#         out_features = out_features or in_features
-#         hidden_features = hidden_features or in_features
-#         bias = to_2tuple(bias)
-#         drop_probs = to_2tuple(drop)
-#         linear_layer = partial(nn.Conv2d, kernel_size=1) if use_conv else nn.Linear
-#
-#         self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0])
-#         self.act = act_layer()
-#         self.drop1 = nn.Dropout(drop_probs[0])
-#         self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
-#         self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1])
-#         self.drop2 = nn.Dropout(drop_probs[1])
-#
-#     def forward(self, x):
-#         x = self.fc1(x)
-#         x = self.act(x)
-#         x = self.drop1(x)
-#         x = self.norm(x)
-#         x = self.fc2(x)
-#         x = self.drop2(x)
-#         return x
+    def forward(self, x):
+        K = self.key(x)
+        V = self.value(x)
+        Z_s = torch.cat([
+            self.self_attention(query(x), K, V) for query in self.querys
+        ], dim=1)
+        Z = torch.matmul(Z_s, self.proj)
+        return Z
+
+
+class GroupedQueryAttention(Attention):
+    r"""
+    https://arxiv.org/pdf/2305.13245.pdf
+    """
+    def __init__(self, word_size: int = 512, embed_dim: int = 64,
+                 n_grouped: int = 4, n_query_each_group:int=2) -> None:
+        super().__init__(word_size, embed_dim)
+
+        self.grouped = nn.ModuleList([
+            MultiQueryAttention(word_size, embed_dim, n_query=n_query_each_group)
+            for _ in range(n_grouped)
+        ])
+        # self.proj = nn.Parameter(torch.empty((..., ...), requires_grad=True))
+        self.proj = nn.Parameter(torch.empty(embed_dim * n_grouped, embed_dim))
+        nn.init.xavier_uniform_(self.proj)
+
+    def forward(self, x: Tensor) -> Tensor:
+        Z_s = torch.cat([head(x) for head in self.grouped], dim=1)
+        Z = torch.matmul(Z_s, self.proj)
+        return Z
 
 
 class DiT(nn.Module):
@@ -388,8 +394,8 @@ class DiT(nn.Module):
         if aux_loss is None or z_loss is None:
             aux_loss, z_loss = MOE_MANAGER.get_loss()
         assert len(aux_loss) == len(z_loss)
-        aux_loss = self.config.router_aux_loss_factor * sum(aux_loss) / len(aux_loss)
-        z_loss = self.config.router_z_loss_factor * sum(z_loss) / len(z_loss)
+        aux_loss = 0.01 * sum(aux_loss) / len(aux_loss)
+        z_loss = 0.0001* sum(z_loss) / len(z_loss)
         return aux_loss, z_loss
 
     def forward(self, x, t, prompts, original_shape, target=None):
@@ -401,13 +407,19 @@ class DiT(nn.Module):
         """
         MOE_MANAGER.reset_loss()
         x = self.x_embedder(x)  # (N, T, D), where T = H * W * 3C / patch_size ** 3
+        print(x.shape)
         t = self.t_embedder(t)  # (N, D)
+        print(t.shape)
         l = self.l_embedder(prompts)
+        print(l.shape)
         c = t + l
         for block in self.blocks:
             x = block(x, c)  # (N, T, D)
+            print(x.shape)
         x = self.final_layer(x, c)  # (N, T, patch_size ** 3)
+        print(x.shape)
         x = self.unpatchify(x, original_shape)  # (N, 3C, H, W)
+        print(x.shape)
         output = x[:, :x.shape[1] // 2, :, :]
         loss = None
         if target:
@@ -421,23 +433,24 @@ class DiT(nn.Module):
 #################################################################################
 
 def DiT_S_DEMO(model_clip, **kwargs):
-    return DiT(model_clip=model_clip, depth=6, hidden_size=128, patch_size=4, num_heads=4, **kwargs)
+    return DiT(model_clip=model_clip, depth=6, hidden_size=32, patch_size=4, num_heads=8, **kwargs)
 
 
 import time
 
 if __name__ == '__main__':
     # 思路1:替换attention操作为restormer的attention机制，在pixel卷机处理，这样不划分patch了，但是后面的MOE还是要继续划分patch token做分发，long token肯定也有问题，前后处理不一致不优雅
-    # 思路2:降低分辨率角度，encoder-decoder做上下采样，可以基于restorer block降低分辨率；  512*512*16 8 降低四倍空间分辨率的方式分别处理，从而在latent space划分patch 马上就干！
+    # 思路2:降低分辨率角度，encoder-decod
+    # encoder做上下采样，可以基于restorer block降低分辨率；  512*512*16 8 降低四倍空间分辨率的方式分别处理，从而在latent space划分patch 马上就干！
     device = "cpu"
     model_clip, _ = clip.load("ViT-B/32", device=device)  # only one 77 embeding is given, thus we can do this also?
     model = DiT_S_DEMO(model_clip).to(device)
-    x = torch.randn((1, 16, 64, 64), device=device,
+    x = torch.randn((1, 16, 512, 512), device=device,
                     dtype=torch.float32)  # 输入xt,ms,duplicate pan-ms 三部分  输入token比较长，重建只在一部分token上计算loss
     y = ["this is a test"]
     y = clip.tokenize(y).to(device)
     time_in = torch.from_numpy(np.random.randint(1, 1000 + 1, size=1)).to(device)
-    original_tuple = (16, 64, 64)
+    original_tuple = (16, 512, 512)
     shape = (x // 4 for x in original_tuple)
     with torch.no_grad():
         output, _ = model(x, time_in, y, shape)
