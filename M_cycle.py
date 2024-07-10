@@ -1,483 +1,558 @@
-import torch
-import torch.nn as nn
+# coding=utf-8
+# Copyright 2023 DeepSeek-AI and The HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+""" PyTorch DeepSeek model."""
 import math
+import warnings
+from typing import List, Optional, Tuple, Union
+
+import torch
 import torch.nn.functional as F
-from transformers import LlamaConfig
-import clip
+import torch.utils.checkpoint
+from torch import nn
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_attn_mask_utils import (
+    AttentionMaskConverter,
+    _prepare_4d_attention_mask,
+    _prepare_4d_causal_attention_mask,
+)
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
+)
+from transformers.modeling_utils import PreTrainedModel
+from transformers.pytorch_utils import (
+    ALL_LAYERNORM_LAYERS,
+    is_torch_greater_or_equal_than_1_13,
+)
+from transformers.utils import (
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    is_flash_attn_2_available,
+    is_flash_attn_greater_or_equal_2_10,
+    logging,
+    replace_return_docstrings,
+)
+from transformers.utils.import_utils import is_torch_fx_available
+from .configuration_deepseek import DeepseekV2Config
+import torch.distributed as dist
 import numpy as np
-from itertools import repeat
-import collections.abc
-from functools import partial
-from colossalai.moe import SparseMLP
-from colossalai.moe.manager import MOE_MANAGER
 
 
-def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-
-def _ntuple(n):
-    def parse(x):
-        if isinstance(x, collections.abc.Iterable) and not isinstance(x, str):
-            return tuple(x)
-        return tuple(repeat(x, n))
-
-    return parse
-
-
-to_1tuple = _ntuple(1)
-to_2tuple = _ntuple(2)
-to_3tuple = _ntuple(3)
-to_4tuple = _ntuple(4)
-
-dtype = torch.float32
-
-
-#################################################################################
-#                                 Sparse MOE Block                           #
-#################################################################################
-
-
-#################################################################################
-#                                 condition modulate                           #
-#################################################################################
-
-
-class Patchify(nn.Module):
-    def __init__(self, patch_size=2, embedding_dim=32):
-        super(Patchify, self).__init__()
-        self.patch_size = patch_size
-        self.embedding_dim = embedding_dim
-
-        # 卷积层用于提取patch
-        self.conv1 = nn.Conv3d(in_channels=1, out_channels=embedding_dim, kernel_size=patch_size,
-                               stride=patch_size)
-
-    def forward(self, x):
-        # b n h w -> b patch**3 nhw//(patch**3) -> b nhw//patch**3 patch**3
-        x = x.unsqueeze(1)
-        b, c, n, h, w = x.shape
-
-        # 确保高度和宽度可以被patch_size整除
-        assert h % self.patch_size == 0 and w % self.patch_size == 0 and n % self.patch_size == 0, "Height and Width must be divisible by patch size"
-
-        # 使用卷积操作来提取patch并进行embedding
-        patches = self.conv1(x)  # 形状为 (b, embedding_dim, n/patch_size, h/patch_size, w/patch_size)
-        # 调整形状为 (b, nhw//(patch**3), embedding_dim)
-        patches = patches.flatten(2).transpose(1, 2)
-
-        return patches
-
-
-class TimestepEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
-
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
+class DeepseekV2RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
         """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
+        DeepseekV2RMSNorm is equivalent to T5LayerNorm
         """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size).type(dtype)
-        t_emb = self.mlp(t_freq)
-        return t_emb
-
-
-class LanguageEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
-
-    def __init__(self, hidden_size, model_clip, language_embedding=512):
         super().__init__()
-        self.model_clip = model_clip.eval()
-        self.mlp = nn.Sequential(
-            nn.Linear(language_embedding, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+ALL_LAYERNORM_LAYERS.append(DeepseekV2RMSNorm)
+
+
+class DeepseekV2RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings,
+            device=self.inv_freq.device,
+            dtype=torch.get_default_dtype(),
+        )
+        self.max_seq_len_cached = None
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(
+            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
         )
 
-    @torch.no_grad()
-    def get_text_feature(self, text):
-        text_feature = self.model_clip.encode_text(text)
-        return text_feature.type(dtype)
+        freqs = torch.outer(t, self.inv_freq.to(t.device))
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
-    def forward(self, prompts):
-        # clip model
-        t_emb = self.get_text_feature(prompts)
-        t_emb = self.mlp(t_emb)
-        return t_emb
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
-
-#################################################################################
-#                                 Core DiT Model                                #
-#################################################################################
-
-##########################################################################
-## Resizing modules
-class Downsample(nn.Module):
-    def __init__(self, n_feat):
-        super(Downsample, self).__init__()
-        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat // 2, kernel_size=3, stride=1, padding=1, bias=False),
-                                  nn.PixelUnshuffle(2))
-
-    def forward(self, x):
-        return self.body(x)
-
-
-class Upsample(nn.Module):
-    def __init__(self, n_feat):
-        super(Upsample, self).__init__()
-        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat * 2, kernel_size=3, stride=1, padding=1, bias=False),
-                                  nn.PixelShuffle(2))
-
-    def forward(self, x):
-        return self.body(x)
-
-
-class DiTBlock(nn.Module):
-    """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    """
-
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = SparseMLP(
-            num_experts=8,
-            hidden_size=128,
-            intermediate_size=mlp_hidden_dim,
-            router_top_k=2,
-            router_capacity_factor_train=1.25,
-            router_capacity_factor_eval=2.0,
-            router_min_capacity=4,
-            router_noisy_policy=None,
-            router_drop_tks=True,
-            mlp_activation="swiglu",
-            mlp_gated=True,
-            enable_load_balance=False,
-            load_balance_tolerance=0.1,
-            load_balance_beam_width=8,
-            load_balance_group_swap_factor=0.4,
-            enable_kernel=False,
-            enable_comm_overlap=False,
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
         )
 
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
 
-    def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        return x
-
-
-class FinalLayer(nn.Module):
-    """
-    The final layer of DiT.
-    """
-
-    def __init__(self, hidden_size, patch_size):
-        super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * patch_size, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
-
-    def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-        return x
-
-
-class Attention(nn.Module):
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int = 8,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            attn_drop: float = 0.,
-            proj_drop: float = 0.,
-            norm_layer: nn.Module = nn.LayerNorm,
-    ) -> None:
-        super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4) #batch num_heads token_num head_dim
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
-
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x = attn @ v
-
-        x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-class  MultiQueryAttention(Attention):
-    r"""
-    https://arxiv.org/pdf/1911.02150.pdf
-    """
-    def __init__(self, word_size: int = 512, embed_dim: int = 64, n_query:int=8) -> None:
-        super().__init__(word_size, embed_dim)
-        self.n_query = n_query
-        self.proj = nn.Parameter(torch.empty(embed_dim * n_query, embed_dim))
-        nn.init.xavier_normal_(self.proj)
-        delattr(self, 'query')
-        self.querys = nn.ModuleList([
-            nn.Linear(in_features=word_size, out_features=embed_dim, bias=True)
-            for _ in range(n_query)
-        ])
-        self.key = nn.Linear(in_features=word_size, out_features=embed_dim, bias=True)
-        self.value = nn.Linear(in_features=word_size, out_features=embed_dim, bias=True)
-
-    def forward(self, x):
-        K = self.key(x)
-        V = self.value(x)
-        Z_s = torch.cat([
-            self.self_attention(query(x), K, V) for query in self.querys
-        ], dim=1)
-        Z = torch.matmul(Z_s, self.proj)
-        return Z
-
-
-class GroupedQueryAttention(Attention):
-    r"""
-    https://arxiv.org/pdf/2305.13245.pdf
-    """
-    def __init__(self, word_size: int = 512, embed_dim: int = 64,
-                 n_grouped: int = 4, n_query_each_group:int=2) -> None:
-        super().__init__(word_size, embed_dim)
-
-        self.grouped = nn.ModuleList([
-            MultiQueryAttention(word_size, embed_dim, n_query=n_query_each_group)
-            for _ in range(n_grouped)
-        ])
-        # self.proj = nn.Parameter(torch.empty((..., ...), requires_grad=True))
-        self.proj = nn.Parameter(torch.empty(embed_dim * n_grouped, embed_dim))
-        nn.init.xavier_uniform_(self.proj)
-
-    def forward(self, x: Tensor) -> Tensor:
-        Z_s = torch.cat([head(x) for head in self.grouped], dim=1)
-        Z = torch.matmul(Z_s, self.proj)
-        return Z
-
-
-class DiT(nn.Module):
-    """
-    Diffusion model with a Transformer backbone.
-    """
+# Copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->DeepseekV2
+class DeepseekV2LinearScalingRotaryEmbedding(DeepseekV2RotaryEmbedding):
+    """DeepseekV2RotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
     def __init__(
-            self,
-            patch_size=4,
-            hidden_size=1152,
-            depth=28,
-            num_heads=16,
-            mlp_ratio=4.0,
-            model_clip=None
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
     ):
+        self.scaling_factor = scaling_factor
+        super().__init__(dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(
+            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+        )
+        t = t / self.scaling_factor
+
+        freqs = torch.outer(t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+
+# Copied from transformers.models.llama.modeling_llama.LlamaDynamicNTKScalingRotaryEmbedding with Llama->DeepseekV2
+class DeepseekV2DynamicNTKScalingRotaryEmbedding(DeepseekV2RotaryEmbedding):
+    """DeepseekV2RotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
+
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+    ):
+        self.scaling_factor = scaling_factor
+        super().__init__(dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+
+        if seq_len > self.max_position_embeddings:
+            base = self.base * (
+                (self.scaling_factor * seq_len / self.max_position_embeddings)
+                - (self.scaling_factor - 1)
+            ) ** (self.dim / (self.dim - 2))
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+            )
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        t = torch.arange(
+            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+        )
+
+        freqs = torch.outer(t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+
+# Inverse dim formula to find dim based on number of rotations
+def yarn_find_correction_dim(
+    num_rotations, dim, base=10000, max_position_embeddings=2048
+):
+    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+        2 * math.log(base)
+    )
+
+
+# Find dim range bounds based on rotations
+def yarn_find_correction_range(
+    low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
+):
+    low = math.floor(
+        yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    )
+    high = math.ceil(
+        yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    )
+    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
+
+
+def yarn_get_mscale(scale=1, mscale=1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def yarn_linear_ramp_mask(min, max, dim):
+    if min == max:
+        max += 0.001  # Prevent singularity
+
+    linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+    ramp_func = torch.clamp(linear_func, 0, 1)
+    return ramp_func
+
+
+class DeepseekV2YarnRotaryEmbedding(DeepseekV2RotaryEmbedding):
+
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+        original_max_position_embeddings=4096,
+        beta_fast=32,
+        beta_slow=1,
+        mscale=1,
+        mscale_all_dim=0,
+    ):
+        self.scaling_factor = scaling_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.mscale = mscale
+        self.mscale_all_dim = mscale_all_dim
+        super().__init__(dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        dim = self.dim
+
+        freq_extra = 1.0 / (
+            self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+        freq_inter = 1.0 / (
+            self.scaling_factor
+            * self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+
+        low, high = yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            dim,
+            self.base,
+            self.original_max_position_embeddings,
+        )
+        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(
+            device=device, dtype=torch.float32
+        )
+        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+
+        freqs = torch.outer(t, inv_freq)
+
+        _mscale = float(
+            yarn_get_mscale(self.scaling_factor, self.mscale)
+            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+        )
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer(
+            "cos_cached", (emb.cos() * _mscale).to(dtype), persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", (emb.sin() * _mscale).to(dtype), persistent=False
+        )
+
+
+# Copied from transformers.models.llama.modeling_llama.rotate_half
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`):
+            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
+            used to pass offsetted position ids when working with a KV-cache.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+
+    b, h, s, d = q.shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+# Copied from transformers.models.llama.modeling_llama.LlamaAttention with Llama->DeepseekV2
+class DeepseekV2Attention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(self, config: DeepseekV2Config, layer_idx: Optional[int] = None):
         super().__init__()
-        self.patch_size = patch_size
-        self.num_heads = num_heads
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
+                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
 
-        # self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        self.x_embedder = Patchify(patch_size, hidden_size)
-        self.t_embedder = TimestepEmbedder(hidden_size)
-        self.l_embedder = LanguageEmbedder(hidden_size, model_clip)
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
-        ])
-        self.final_layer = FinalLayer(hidden_size, patch_size)
-        self.initialize_weights()
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
 
-    def initialize_weights(self):
-        # Initialize transformer layers:
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.q_lora_rank = config.q_lora_rank
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+        self.v_head_dim = config.v_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
-        self.apply(_basic_init)
+        self.is_causal = True
 
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.conv1.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.conv1.bias, 0)
+        self.q_a_proj = nn.Linear(
+            self.hidden_size, config.q_lora_rank, bias=config.attention_bias
+        )
+        self.q_a_layernorm = DeepseekV2RMSNorm(config.q_lora_rank)
+        self.q_b_proj = nn.Linear(
+            config.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
+        )
 
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-        nn.init.normal_(self.l_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.l_embedder.mlp[2].weight, std=0.02)
+        self.kv_a_proj_with_mqa = nn.Linear(
+            self.hidden_size,
+            config.kv_lora_rank + config.qk_rope_head_dim,
+            bias=config.attention_bias,
+        )
+        self.kv_a_layernorm = DeepseekV2RMSNorm(config.kv_lora_rank)
+        self.kv_b_proj = nn.Linear(
+            config.kv_lora_rank,
+            self.num_heads
+            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
+            bias=False,
+        )
 
-        # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        self.o_proj = nn.Linear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=config.attention_bias,
+        )
+        self._init_rope()
 
-        # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        self.softmax_scale = self.q_head_dim ** (-0.5)
+        if self.config.rope_scaling is not None:
+            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = self.config.rope_scaling["factor"]
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.softmax_scale = self.softmax_scale * mscale * mscale
 
-    def unpatchify(self, x, original_shape):
-        """
-        #4*4*4=64
-        x: (N, T, patch_size**2*outchannel)
-        imgs: (N, C, H, W)
-        """
-        p = self.x_embedder.patch_size
-        c, h, w = original_shape
+    def _init_rope(self):
+        if self.config.rope_scaling is None:
+            self.rotary_emb = DeepseekV2RotaryEmbedding(
+                self.qk_rope_head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+            )
+        else:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            if scaling_type == "linear":
+                self.rotary_emb = DeepseekV2LinearScalingRotaryEmbedding(
+                    self.qk_rope_head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = DeepseekV2DynamicNTKScalingRotaryEmbedding(
+                    self.qk_rope_head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                )
+            elif scaling_type == "yarn":
+                kwargs = {
+                    key: self.config.rope_scaling[key]
+                    for key in [
+                        "original_max_position_embeddings",
+                        "beta_fast",
+                        "beta_slow",
+                        "mscale",
+                        "mscale_all_dim",
+                    ]
+                    if key in self.config.rope_scaling
+                }
+                self.rotary_emb = DeepseekV2YarnRotaryEmbedding(
+                    self.qk_rope_head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                    **kwargs,
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
-        x = x.reshape(shape=(x.shape[0], c, h, w, p, p, p))
-        x = torch.einsum('nchwpqe->ncphqwe', x)
-        imgs = x.reshape(shape=(x.shape[0], c * p, h * p, h * p))
-        return imgs
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
+        bsz, q_len, _ = hidden_states.size()
 
-    def _calculate_router_loss(self, aux_loss: list = None, z_loss: list = None):
-        if aux_loss is None or z_loss is None:
-            aux_loss, z_loss = MOE_MANAGER.get_loss()
-        assert len(aux_loss) == len(z_loss)
-        aux_loss = 0.01 * sum(aux_loss) / len(aux_loss)
-        z_loss = 0.0001* sum(z_loss) / len(z_loss)
-        return aux_loss, z_loss
+        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
 
-    def forward(self, x, t, prompts, original_shape, target=None):
-        """
-        Forward pass of DiT.
-        x: (N, 3C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
-        """
-        MOE_MANAGER.reset_loss()
-        x = self.x_embedder(x)  # (N, T, D), where T = H * W * 3C / patch_size ** 3
-        print(x.shape)
-        t = self.t_embedder(t)  # (N, D)
-        print(t.shape)
-        l = self.l_embedder(prompts)
-        print(l.shape)
-        c = t + l
-        for block in self.blocks:
-            x = block(x, c)  # (N, T, D)
-            print(x.shape)
-        x = self.final_layer(x, c)  # (N, T, patch_size ** 3)
-        print(x.shape)
-        x = self.unpatchify(x, original_shape)  # (N, 3C, H, W)
-        print(x.shape)
-        output = x[:, :x.shape[1] // 2, :, :]
-        loss = None
-        if target:
-            aux_loss, z_loss = self._calculate_router_loss()
-            loss = aux_loss + z_loss + F.l1_loss(output, target)
-        return output, loss
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        compressed_kv, k_pe = torch.split(
+            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        kv = (
+            self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
+            .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            .transpose(1, 2)
+        )
+
+        k_nope, value_states = torch.split(
+            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+        kv_seq_len = value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+
+        query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+
+        key_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+
+        attn_weights = (
+            torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
+        )
+
+        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+        assert attention_mask is not None
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(
+            attn_weights, p=self.attention_dropout, training=self.training
+        )
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights
 
 
-#################################################################################
-#                                   DiT Configs                                  #
-#################################################################################
 
-def DiT_S_DEMO(model_clip, **kwargs):
-    return DiT(model_clip=model_clip, depth=6, hidden_size=32, patch_size=4, num_heads=8, **kwargs)
+"""
+forward of model: 
+     if position_ids is None:
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            position_ids = torch.arange(
+                past_key_values_length,
+                seq_length + past_key_values_length,
+                dtype=torch.long,
+                device=device,
+            )
+            position_ids = position_ids.unsqueeze(0)
 
-
-import time
-
-if __name__ == '__main__':
-    # 思路1:替换attention操作为restormer的attention机制，在pixel卷机处理，这样不划分patch了，但是后面的MOE还是要继续划分patch token做分发，long token肯定也有问题，前后处理不一致不优雅
-    # 思路2:降低分辨率角度，encoder-decod
-    # encoder做上下采样，可以基于restorer block降低分辨率；  512*512*16 8 降低四倍空间分辨率的方式分别处理，从而在latent space划分patch 马上就干！
-    device = "cpu"
-    model_clip, _ = clip.load("ViT-B/32", device=device)  # only one 77 embeding is given, thus we can do this also?
-    model = DiT_S_DEMO(model_clip).to(device)
-    x = torch.randn((1, 16, 512, 512), device=device,
-                    dtype=torch.float32)  # 输入xt,ms,duplicate pan-ms 三部分  输入token比较长，重建只在一部分token上计算loss
-    y = ["this is a test"]
-    y = clip.tokenize(y).to(device)
-    time_in = torch.from_numpy(np.random.randint(1, 1000 + 1, size=1)).to(device)
-    original_tuple = (16, 512, 512)
-    shape = (x // 4 for x in original_tuple)
-    with torch.no_grad():
-        output, _ = model(x, time_in, y, shape)
-    t2 = time.time()
-    print(output.shape)
-
-    # optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-    # # 生成随机目标数据
-    # targets = torch.randn(batch_size,input_size, hidden_size)
-
-    # # 训练循环
-    # num_epochs = 10
-    # for epoch in range(num_epochs):
-    #     model.train()
-    #     optimizer.zero_grad()
-
-    #     outputs,loss = model(inputs,targets)
-
-    #     loss.backward()
-    #     optimizer.step()
-
-    #     print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item()}")
-
-    # # 推理
-    # model.eval()
-    # with torch.no_grad():
-    #     test_inputs = torch.randn(batch_size, input_size,hidden_size)
-    #     test_outputs,_ = model(test_inputs)
-    #     print("Inference output:", test_outputs.shape)
+"""
