@@ -429,7 +429,7 @@ class MOENetWork(nn.Module):
         t = self.t_embedder(t)  # (N, D)
         c = t + self.l_embedder(prompts1) + self.l_embedder(prompts2)
 
-       
+
         return output
 
 #################################################################################
