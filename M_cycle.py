@@ -1,459 +1,417 @@
+#################################################################################
+#                                 MOE_Conv                                 #
+#################################################################################
+import torch
+from torch import autograd, nn as nn
+
+
+
+def get_device(x):
+    gpu_idx = x.get_device()
+    return f"cuda:{gpu_idx}" if gpu_idx >= 0 else "cpu"
+
 import torch
 import torch.nn as nn
-import math
 import torch.nn.functional as F
-from transformers import LlamaConfig
-import clip
-import numpy as np
-from itertools import repeat
-import collections.abc
-from functools import partial
-from colossalai.moe import SparseMLP
-from colossalai.moe.manager import MOE_MANAGER
+
+class Router(nn.Module):
+    def __init__(self,in_channels,out_channels):
+        super().__init__()
+        self.router = nn.Linear(in_channels,out_channels)
+
+    def forward(self,x):
+        return self.router(x)
+    
+
+class MoEConv(nn.Conv3d):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1):
+        super(MoEConv, self).__init__(in_channels, out_channels, kernel_size, stride, padding)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.router = Router(512,out_channels)
+        self.softmax = nn.Softmax(-1)
+
+    def forward(self, x,y):
+        # Assuming router function returns a tensor of shape (batch_size, n_expert)
+        self.scores = self.softmax(self.router(y))  # Shape: (batch_size, n_expert)
+
+        # Perform the convolution operation
+        out = super(MoEConv, self).forward(x)  # Shape: (batch_size, out_channels * n_expert, D, H, W)
+
+        # Apply scores to select channels
+        scores_expanded = self.scores.unsqueeze(2).unsqueeze(3).unsqueeze(4)  # Shape: (batch_size, C, 1, 1, 1)
+        out_selected = (out * scores_expanded).sum(dim=1)  # Shape: (batch_size, out_channels, D, H, W)
+
+        return out_selected
 
 
-def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
-def _ntuple(n):
-    def parse(x):
-        if isinstance(x, collections.abc.Iterable) and not isinstance(x, str):
-            return tuple(x)
-        return tuple(repeat(x, n))
-
-    return parse
 
 
-to_1tuple = _ntuple(1)
-to_2tuple = _ntuple(2)
-to_3tuple = _ntuple(3)
-to_4tuple = _ntuple(4)
-
-dtype = torch.float32
+## Restormer: Efficient Transformer for High-Resolution Image Restoration
+## Syed Waqas Zamir, Aditya Arora, Salman Khan, Munawar Hayat, Fahad Shahbaz Khan, and Ming-Hsuan Yang
+## https://arxiv.org/abs/2111.09881
 
 
-#################################################################################
-#                                 Sparse MOE Block                           #
-#################################################################################
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pdb import set_trace as stx
+import numbers
+
+from einops import rearrange
 
 
-#################################################################################
-#                                 condition modulate                           #
-#################################################################################
+
+##########################################################################
+## Layer Norm
 
 
-class Patchify(nn.Module):
-    def __init__(self, patch_size=2, embedding_dim=32):
-        super(Patchify, self).__init__()
-        self.patch_size = patch_size
-        self.embedding_dim = embedding_dim
 
-        # 卷积层用于提取patch
-        self.conv1 = nn.Conv3d(in_channels=1, out_channels=embedding_dim, kernel_size=patch_size,
-                               stride=patch_size)
+class BiasFree_LayerNorm(nn.Module):
+    def __init__(self, normalized_shape):
+        super(BiasFree_LayerNorm, self).__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        normalized_shape = torch.Size(normalized_shape)
+
+        assert len(normalized_shape) == 1
+
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.normalized_shape = normalized_shape
 
     def forward(self, x):
-        # b n h w -> b patch**3 nhw//(patch**3) -> b nhw//patch**3 patch**3
-        x = x.unsqueeze(1)
+        sigma = x.var(-1, keepdim=True, unbiased=False)
+        return x / torch.sqrt(sigma+1e-5) * self.weight
+
+class WithBias_LayerNorm(nn.Module):
+    def __init__(self, normalized_shape):
+        super(WithBias_LayerNorm, self).__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        normalized_shape = torch.Size(normalized_shape)
+
+        assert len(normalized_shape) == 1
+
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.normalized_shape = normalized_shape
+
+    def forward(self, x):
+        mu = x.mean(-1, keepdim=True)
+        sigma = x.var(-1, keepdim=True, unbiased=False)
+        return (x - mu) / torch.sqrt(sigma+1e-5) * self.weight + self.bias
+
+def to_3d(x):
+    return rearrange(x, 'b c n h w -> b (n h w) c')
+
+def to_4d(x,n,h,w):
+    return rearrange(x, 'b (n h w) c -> b c n h w',n=n,h=h,w=w)
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim, LayerNorm_type):
+        super(LayerNorm, self).__init__()
+        if LayerNorm_type =='BiasFree':
+            self.body = BiasFree_LayerNorm(dim)
+        else:
+            self.body = WithBias_LayerNorm(dim)
+
+    def forward(self, x):
+        n, h, w = x.shape[-3:]
+        return to_4d(self.body(to_3d(x)),n, h, w)
+
+
+
+##########################################################################
+## Gated-Dconv Feed-Forward Network (GDFN)
+class FeedForward(nn.Module):
+    def __init__(self, dim, ffn_expansion_factor, bias):
+        super(FeedForward, self).__init__()
+
+        hidden_features = int(dim*ffn_expansion_factor)
+
+        self.project_in = nn.Conv2d(dim, hidden_features*2, kernel_size=1, bias=bias)
+
+        self.dwconv = nn.Conv2d(hidden_features*2, hidden_features*2, kernel_size=3, stride=1, padding=1, groups=hidden_features*2, bias=bias)
+
+        self.project_out = nn.Conv2d(hidden_features, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        x = self.project_in(x)
+        x1, x2 = self.dwconv(x).chunk(2, dim=1)
+        x = F.gelu(x1) * x2
+        x = self.project_out(x)
+        return x
+
+
+
+##########################################################################
+## Multi-DConv Head Transposed Self-Attention (MDTA)
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads, bias):
+        super(Attention, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        self.qkv = nn.Conv2d(dim, dim*3, kernel_size=1, bias=bias)
+        self.qkv_dwconv = nn.Conv2d(dim*3, dim*3, kernel_size=3, stride=1, padding=1, groups=dim*3, bias=bias)
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        
+
+
+    def forward(self, x):
+        b,c,h,w = x.shape
+
+        qkv = self.qkv_dwconv(self.qkv(x))
+        q,k,v = qkv.chunk(3, dim=1)   
+        
+        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+
+        out = (attn @ v)
+        
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+
+        out = self.project_out(out)
+        return out
+
+class Attention3D(nn.Module):
+    def __init__(self, dim, num_heads, bias):
+        super(Attention3D, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1, 1))
+
+        self.qkv = nn.Conv3d(dim, dim*3, kernel_size=1, bias=bias)
+        self.qkv_dwconv = nn.Conv3d(dim*3, dim*3, kernel_size=3, stride=1, padding=1, groups=dim*3, bias=bias)
+        self.project_out = nn.Conv3d(dim, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x):
         b, c, n, h, w = x.shape
 
-        # 确保高度和宽度可以被patch_size整除
-        assert h % self.patch_size == 0 and w % self.patch_size == 0 and n % self.patch_size == 0, "Height and Width must be divisible by patch size"
+        qkv = self.qkv_dwconv(self.qkv(x))
+        q, k, v = qkv.chunk(3, dim=1)
 
-        # 使用卷积操作来提取patch并进行embedding
-        patches = self.conv1(x)  # 形状为 (b, embedding_dim, n/patch_size, h/patch_size, w/patch_size)
-        # 调整形状为 (b, nhw//(patch**3), embedding_dim)
-        patches = patches.flatten(2).transpose(1, 2)
+        q = rearrange(q, 'b (head c) n h w -> b head c (n h w)', head=self.num_heads) #n*h*w就是 hidden dim  
+        k = rearrange(k, 'b (head c) n h w -> b head c (n h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) n h w -> b head c (n h w)', head=self.num_heads) 
 
-        return patches
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
 
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)#b head c*c的attention score
 
-class TimestepEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
+        out = (attn @ v)
+        
+        out = rearrange(out, 'b head c (n h w) -> b (head c) n h w', head=self.num_heads, n=n, h=h, w=w)
 
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size).type(dtype)
-        t_emb = self.mlp(t_freq)
-        return t_emb
+        out = self.project_out(out)
+        return out
 
 
-class LanguageEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
+##########################################################################
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type):
+        super(TransformerBlock, self).__init__()
 
-    def __init__(self, hidden_size, model_clip, language_embedding=512):
-        super().__init__()
-        self.model_clip = model_clip.eval()
-        self.mlp = nn.Sequential(
-            nn.Linear(language_embedding, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
+        self.norm1 = LayerNorm(dim, LayerNorm_type)
+        self.attn = Attention(dim, num_heads, bias)
+        self.norm2 = LayerNorm(dim, LayerNorm_type)
+        self.ffn = FeedForward(dim, ffn_expansion_factor, bias)
 
-    @torch.no_grad()
-    def get_text_feature(self, text):
-        text_feature = self.model_clip.encode_text(text)
-        return text_feature.type(dtype)
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
 
-    def forward(self, prompts):
-        t_emb = self.get_text_feature(prompts)
-        t_emb = self.mlp(t_emb)
-        return t_emb
+        return x
+
+class Transformer3DBlock(nn.Module):
+    def __init__(self, dim, num_heads, bias, LayerNorm_type):
+        super(Transformer3DBlock, self).__init__()
+
+        self.norm1 = LayerNorm(dim, LayerNorm_type)
+        self.attn = Attention3D(dim, num_heads, bias)
+        self.norm2 = LayerNorm(dim, LayerNorm_type)
+        self.ffn = MoEConv(dim,dim)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
+        return x
 
 
-#################################################################################
-#                                 Core DiT Model                                #
-#################################################################################
+
+##########################################################################
+## Overlapped image patch embedding with 3x3 Conv
+class OverlapPatchEmbed(nn.Module):
+    def __init__(self, in_c=3, embed_dim=48, bias=False):
+        super(OverlapPatchEmbed, self).__init__()
+
+        self.proj = nn.Conv3d(in_c, embed_dim, kernel_size=3, stride=1, padding=1, bias=bias)
+
+    def forward(self, x):
+        x = self.proj(x)
+
+        return x
+
+
 
 ##########################################################################
 ## Resizing modules
 class Downsample(nn.Module):
     def __init__(self, n_feat):
         super(Downsample, self).__init__()
-        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat // 2, kernel_size=3, stride=1, padding=1, bias=False),
-                                  nn.PixelUnshuffle(2))
+        #b c n h w->downsample b c//2 n h w-> bn c//2 h w -> bn c*2 h/2 w/2  -> b c**2 n h/2 w/2  
+        self.body = nn.Conv2d(n_feat, n_feat//2, kernel_size=3, stride=1, padding=1, bias=False)
+        self.unshuffle =  nn.PixelUnshuffle(2)
 
     def forward(self, x):
-        return self.body(x)
-
+        b,c,n,h,w = x.size()
+        x = self.body(x)
+        x = x.transpose(2,1).view(b*n,c//2,h,w)
+        x = self.unshuffle(x).view(b,n,c*2,h//2,w//2).transpose(2,1)
+        return x
 
 class Upsample(nn.Module):
     def __init__(self, n_feat):
         super(Upsample, self).__init__()
-        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat * 2, kernel_size=3, stride=1, padding=1, bias=False),
-                                  nn.PixelShuffle(2))
+
+        self.body = nn.Conv2d(n_feat, n_feat*2, kernel_size=3, stride=1, padding=1, bias=False),
+        self.shuffle =  nn.PixelShuffle(2)
 
     def forward(self, x):
-        return self.body(x)
-
-
-class DiTBlock(nn.Module):
-    """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    """
-
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = SparseMLP(
-            num_experts=8,
-            hidden_size=128,
-            intermediate_size=mlp_hidden_dim,
-            router_top_k=2,
-            router_capacity_factor_train=1.25,
-            router_capacity_factor_eval=2.0,
-            router_min_capacity=4,
-            router_noisy_policy=None,
-            router_drop_tks=True,
-            mlp_activation="swiglu",
-            mlp_gated=True,
-            enable_load_balance=False,
-            load_balance_tolerance=0.1,
-            load_balance_beam_width=8,
-            load_balance_group_swap_factor=0.4,
-            enable_kernel=False,
-            enable_comm_overlap=False,
-        )
-
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
-
-    def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        # #b c n h w->upsample b c**2 n h w-> bn c**2 h w -> bn c//2 h*2 w*2  -> b c**2 n h/2 w/2  
+        b,c,n,h,w = x.size()
+        x = self.body(x)
+        x = x.transpose(2,1).view(b*n,c*2,h,w)
+        x = self.unshuffle(x).view(b,n,c//2,h*2,w*2).transpose(2,1)
         return x
 
-
-class FinalLayer(nn.Module):
-    """
-    The final layer of DiT.
-    """
-
-    def __init__(self, hidden_size, patch_size):
-        super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * patch_size, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
-
-    def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-        return x
-
-
-class Attention(nn.Module):
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int = 8,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            attn_drop: float = 0.,
-            proj_drop: float = 0.,
-            norm_layer: nn.Module = nn.LayerNorm,
-    ) -> None:
-        super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1,
-                                                                                  4)  # batch num_heads token_num head_dim
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
-
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x = attn @ v
-
-        x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class DiT(nn.Module):
-    """
-    Diffusion model with a Transformer backbone.
-    """
-
-    def __init__(
-            self,
-            patch_size=4,
-            hidden_size=1152,
-            depth=28,
-            num_heads=16,
-            mlp_ratio=4.0,
-            model_clip=None
+##########################################################################
+##---------- Restormer -----------------------
+class Restormer(nn.Module):
+    #转换为3D网络的基本结构
+    def __init__(self, 
+        inp_channels=3, 
+        out_channels=3, 
+        dim = 48,
+        num_blocks = [1,2,2,1], 
+        num_refinement_blocks = 1,
+        heads = [1,2,4,8],
+        ffn_expansion_factor = 2.66,
+        bias = False,
+        LayerNorm_type = 'WithBias',   ## Other option 'BiasFree'
+        dual_pixel_task = True        ## True for dual-pixel defocus deblurring only. Also set inp_channels=6
     ):
-        super().__init__()
-        self.patch_size = patch_size
-        self.num_heads = num_heads
 
-        # self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        self.x_embedder = Patchify(patch_size, hidden_size)
-        self.t_embedder = TimestepEmbedder(hidden_size)
-        self.l_embedder = LanguageEmbedder(hidden_size, model_clip)
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
-        ])
-        self.final_layer = FinalLayer(hidden_size, patch_size)
-        self.initialize_weights()
+        super(Restormer, self).__init__()
 
-    def initialize_weights(self):
-        # Initialize transformer layers:
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
+        self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
 
-        self.apply(_basic_init)
+        self.encoder_level1 = nn.Sequential(*[Transformer3DBlock(dim=dim, num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[0])])
+        
+        self.down1_2 = Downsample(dim) ## From Level 1 to Level 2
+        self.encoder_level2 = nn.Sequential(*[Transformer3DBlock(dim=int(dim*2**1), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[1])])
+        
+        self.down2_3 = Downsample(int(dim*2**1)) ## From Level 2 to Level 3  *2
+        self.encoder_level3 = nn.Sequential(*[Transformer3DBlock(dim=int(dim*2**2), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[2])])
 
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.conv1.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.conv1.bias, 0)
-
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-        nn.init.normal_(self.l_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.l_embedder.mlp[2].weight, std=0.02)
-
-        # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def unpatchify(self, x, original_shape):
-        """
-        x: (N, T, patch_size**3) T = C H W //patch**3
-        imgs: (N, C, H, W)
-        """
-        p = self.x_embedder.patch_size
-        c, h, w = original_shape
-
-        x = x.reshape(shape=(x.shape[0], c, h, w, p, p, p))
-        x = torch.einsum('nchwpqe->ncphqwe', x)
-        imgs = x.reshape(shape=(x.shape[0], c * p, h * p, h * p))
-        return imgs
-
-    def _calculate_router_loss(self, aux_loss: list = None, z_loss: list = None):
-        if aux_loss is None or z_loss is None:
-            aux_loss, z_loss = MOE_MANAGER.get_loss()
-        assert len(aux_loss) == len(z_loss)
-        aux_loss = 0.01 * sum(aux_loss) / len(aux_loss)
-        z_loss = 0.0001 * sum(z_loss) / len(z_loss)
-        return aux_loss, z_loss
-
-    def forward(self, x, t, prompts1, prompts2, original_shape, target=None):
-        """
-        Forward pass of DiT.
-        x: (N, 3C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
-        """
-        MOE_MANAGER.reset_loss()
-        x = self.x_embedder(x)  # (N, T, D), where T = H * W * 2C / patch_size ** 3
-        t = self.t_embedder(t)  # (N, D)
-        c = t + self.l_embedder(prompts1) + self.l_embedder(prompts2)
-        for block in self.blocks:
-            x = block(x, c)  # (N, T, D)
-        x = self.final_layer(x, c)  # (N, T, patch_size ** 3)
-        x = self.unpatchify(x, original_shape)  # (N, 2C, H, W)
-        output = x[:, :x.shape[1] // 2, :, :]
-        loss = None
-        if target is not None:
-            aux_loss, z_loss = self._calculate_router_loss()
-            loss = aux_loss + z_loss + F.l1_loss(output, target, reduction="mean")
-            print(loss.item(), aux_loss.item(), z_loss.item())
-        return output, loss
+        self.down3_4 = Downsample(int(dim*2**2)) ## From Level 3 to Level 4  *4
+        self.latent = nn.Sequential(*[Transformer3DBlock(dim=int(dim*2**3), num_heads=heads[3], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[3])])
+        
+        self.up4_3 = Upsample(int(dim*2**3)) ## From Level 4 to Level 3      *8
+        self.reduce_chan_level3 = nn.Conv2d(int(dim*2**3), int(dim*2**2), kernel_size=1, bias=bias)
+        self.decoder_level3 = nn.Sequential(*[Transformer3DBlock(dim=int(dim*2**2), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[2])])
 
 
-class Router(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.router = nn.Linear(in_channels, out_channels)
+        self.up3_2 = Upsample(int(dim*2**2)) ## From Level 3 to Level 2
+        self.reduce_chan_level2 = nn.Conv2d(int(dim*2**2), int(dim*2**1), kernel_size=1, bias=bias)
+        self.decoder_level2 = nn.Sequential(*[Transformer3DBlock(dim=int(dim*2**1), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[1])])
+        
+        self.up2_1 = Upsample(int(dim*2**1))  ## From Level 2 to Level 1  (NO 1x1 conv to reduce channels)
 
-    def forward(self, x):
-        return self.router(x)
+        self.decoder_level1 = nn.Sequential(*[Transformer3DBlock(dim=int(dim*2**1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[0])])
+        
+        self.refinement = nn.Sequential(*[Transformer3DBlock(dim=int(dim*2**1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_refinement_blocks)])
+        
+        #### For Dual-Pixel Defocus Deblurring Task ####
+        self.dual_pixel_task = dual_pixel_task
+        if self.dual_pixel_task:
+            self.skip_conv = nn.Conv3d(dim, int(dim*2**1), kernel_size=1, bias=bias)
+        ###########################
+            
+        self.output = nn.Conv3d(int(dim*2**1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
 
-class MoEConv(nn.Conv3d):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1, ratio=0.5):
-        super(MoEConv, self).__init__(in_channels, out_channels, kernel_size, stride, padding)
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.router = Router(512, out_channels)
-        self.top_k = int(ratio*out_channels)
+    def forward(self, inp_img):
+        #b 3 c h w input --> b 1 c h w --> b c h w for loss function
+        inp_enc_level1 = self.patch_embed(inp_img)
+        out_enc_level1 = self.encoder_level1(inp_enc_level1)
+        print(inp_enc_level1.shape,out_enc_level1.shape)
+        
+        inp_enc_level2 = self.down1_2(out_enc_level1)
+        out_enc_level2 = self.encoder_level2(inp_enc_level2)
+        print(inp_enc_level2.shape,out_enc_level2.shape)
 
-    def forward(self, x, y):
-        # Assuming router function returns a tensor of shape (batch_size, n_expert)
-        self.scores = self.router(y)  # Shape: (batch_size, n_expert)
+        inp_enc_level3 = self.down2_3(out_enc_level2)
+        out_enc_level3 = self.encoder_level3(inp_enc_level3) 
+        print(inp_enc_level3.shape,out_enc_level3.shape)
 
-        # Get the top-K scores and their indices
-        topk_scores, topk_indices = torch.topk(self.scores, self.top_k, dim=1)
+        inp_enc_level4 = self.down3_4(out_enc_level3)        
+        latent = self.latent(inp_enc_level4) 
+        print(inp_enc_level4.shape,latent.shape)
+                        
+        inp_dec_level3 = self.up4_3(latent)
+        inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 1)
+        inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
+        out_dec_level3 = self.decoder_level3(inp_dec_level3) 
 
-        # Create a mask with 1s at the top-K indices and 0s elsewhere
-        mask = torch.zeros_like(self.scores)
-        mask.scatter_(1, topk_indices, 1)
+        inp_dec_level2 = self.up3_2(out_dec_level3)
+        inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], 1)
+        inp_dec_level2 = self.reduce_chan_level2(inp_dec_level2)
+        out_dec_level2 = self.decoder_level2(inp_dec_level2) 
 
-        # Perform the convolution operation
-        out = super(MoEConv, self).forward(x)  # Shape: (batch_size, out_channels * n_expert, D, H, W)
+        inp_dec_level1 = self.up2_1(out_dec_level2)
+        inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
+        out_dec_level1 = self.decoder_level1(inp_dec_level1)
+        
+        out_dec_level1 = self.refinement(out_dec_level1)
 
-        # Apply the mask to the scores
-        scores_expanded = mask.unsqueeze(2).unsqueeze(3).unsqueeze(4)  # Shape: (batch_size, C, 1, 1, 1)
-        out_selected = (out * scores_expanded).sum(dim=1)  # Shape: (batch_size, out_channels, D, H, W)
-
-        return out_selected
-
-class MOENetWork(nn.Module):
-    """
-    Diffusion model with a Transformer backbone.
-    """
-
-    def __init__(
-            self,
-            hidden_size=1152,
-            model_clip=None
-    ):
-        super().__init__()
-
-        self.t_embedder = TimestepEmbedder(hidden_size)
-        self.l_embedder = LanguageEmbedder(hidden_size, model_clip)
-
-    def forward(self, x, t, prompts1, prompts2):
-        x = self.x_embedder(x)  # (N, T, D), where T = H * W * 2C / patch_size ** 3
-        t = self.t_embedder(t)  # (N, D)
-        c = t + self.l_embedder(prompts1) + self.l_embedder(prompts2)
-
-
-        return output
-
-#################################################################################
-#                                   DiT Configs                                  #
-#################################################################################
-
-def DiT_S_DEMO(model_clip, **kwargs):
-    return DiT(model_clip=model_clip, depth=6, hidden_size=128, patch_size=4, num_heads=4, **kwargs)
+        #### For Dual-Pixel Defocus Deblurring Task ####
+        if self.dual_pixel_task:
+            out_dec_level1 = out_dec_level1 + self.skip_conv(inp_enc_level1)
+            out_dec_level1 = self.output(out_dec_level1)
+        ###########################
+        else:
+            out_dec_level1 = self.output(out_dec_level1) + inp_img
 
 
-import time
+        return out_dec_level1
+    
 
-if __name__ == '__main__':
-    device = "cuda:2"
-    model_clip, _ = clip.load("ViT-B/32", device=device)  # only one 77 embeding is given, thus we can do this also?
-    model = DiT_S_DEMO(model_clip).to(device)
-    x = torch.randn((1, 8, 256, 256), device=device,
-                    dtype=torch.float32)  # 输入xt,ms,duplicate pan-ms 三部分  输入token比较长，重建只在一部分token上计算loss
-    y = "this is a test"
-    y = clip.tokenize(y).to(device)
-    time_in = torch.from_numpy(np.random.randint(1, 1000 + 1, size=1)).to(device)
-    original_tuple = (8, 256, 256)
-    print(time_in, time_in.shape)
-    with torch.no_grad():
-        output, _ = model(x, time_in, y, y)
-    t2 = time.time()
-    print(output.shape)
+
+
+# Example usage
+in_channels = 3
+out_channels = 32
+kernel_size = 3
+x = torch.randn(8, in_channels, 32, 32, 32)  # Example input tensor
+
+moe_conv = MoEConv(in_channels, out_channels, kernel_size)
+y = torch.randn(8,512)
+output = moe_conv(x,y)
+print(output.shape)  # Should be (8, out_channels, 30, 30, 30) if stride=1 and padding=1
+
+#input b 3 8 64 64   b 3 4 64 64
+#output b 1 8 64 64  b 1 3 64 64
+model = Restormer(inp_channels=3,out_channels=1,dim=48)
+img = torch.randn(10,3,64,64)
+output = model(img)
+print(output.shape)
