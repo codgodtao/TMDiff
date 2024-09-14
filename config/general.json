@@ -1,0 +1,71 @@
+{
+  "name": "QB_training_baseline_64",
+  "info": "using QB only",
+  "phase": "train",
+  "distributed": true,
+  // train or val
+  "gpu_ids": [
+    2,3
+  ],
+  "path": {
+    //set the path
+    "log": "logs",
+    "tb_logger": "tb_logger",
+    "results": "results",
+    "checkpoint": "checkpoint",
+    "resume": null
+  },
+  "datasets": {
+    "train_qb": {
+      "dataroot": "/data/qlt/pancollection/training_data/train_qb_data.h5",
+      "batch_size": 32,
+      "num_workers": 8,
+      "use_shuffle": true,
+      "data_len": -1
+    },
+    "val_QB": {
+      "dataroot": "/data/qlt/pancollection/test_data/QB/test_qb_data_RR.h5",
+      "data_len": -1
+    },
+    "val_GF2": {
+      "dataroot": "/data/qlt/pancollection/test_data/GF2/test_gf2_data_RR.h5",
+      "data_len": -1
+    },
+    "val_WV3": {
+      "dataroot": "/data/qlt/pancollection/test_data/WV3/test_wv3_data_RR.h5",
+      "data_len": -1
+    }
+  },
+  "model": {
+    "beta_schedule": {
+      "train": {
+        "schedule": "cosine",
+        "n_timestep": 1000
+      },
+      "val": {
+        "schedule": "cosine",
+        "n_timestep": 1000
+      }
+    },
+    "init_type": "orthogonal",
+    "unet": {
+      "channel_multiplier": [
+        64,128,256,512
+      ]
+    },
+    "diffusion": {
+      "loss_type": "l1"
+    }
+  },
+  "train": {
+    "val_freq": 10000,
+    "save_checkpoint_freq": 10000,
+    "print_freq": 50,
+    "optimizer": {
+      "lr": 1e-3
+    }
+  }
+}
+
+
+

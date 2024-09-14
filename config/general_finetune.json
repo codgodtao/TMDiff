@@ -1,0 +1,84 @@
+{
+  "name": "best",
+  "info": "32 16 8 4",
+  "phase": "val",
+  "distributed": false,
+  "gpu_ids": [
+    0
+  ],
+  "path": {
+    "log": "logs",
+    "tb_logger": "tb_logger",
+    "results": "results",
+    "checkpoint": "checkpoint",
+    "resume": "/home/wangsong/EM_sharpening/experiments/I100000"
+  },
+  "datasets": {
+    "train_qb": {
+      "dataroot": "/home/wangsong/geochat/pansharpening/training_data/train_qb_data.h5",
+      "batch_size": 4,
+      "num_workers": 1,
+      "use_shuffle": true,
+      "data_len": -1
+    },
+    "train_gf2": {
+      "dataroot": "/home/wangsong/geochat/pansharpening/training_data/train_gf2_data.h5",
+      "batch_size": 4,
+      "num_workers": 1,
+      "use_shuffle": true,
+      "data_len": -1
+    },
+    "train_wv3": {
+      "dataroot": "/home/wangsong/geochat/pansharpening/training_data/train_wv3_data.h5",
+      "batch_size": 4,
+      "num_workers": 1,
+      "use_shuffle": true,
+      "data_len": -1
+    },
+    "val_QB": {
+      "dataroot": "/home/wangsong/geochat/pansharpening/test_data/QB/test_qb_data_RR.h5",
+      "data_len": -1
+    },
+      "val_GF2": {
+      "dataroot": "/home/wangsong/geochat/pansharpening/test_data/GF2/test_gf2_data_RR.h5",
+      "data_len": -1
+    },
+    "val_WV3": {
+      "dataroot": "/home/wangsong/geochat/pansharpening/test_data/WV3/test_wv3_data_RR.h5",
+      "data_len": -1
+    }
+  },
+  "model": {
+    "beta_schedule": {
+      "train": {
+        "schedule": "cosine",
+        "n_timestep": 1000
+      },
+      "val": {
+        "schedule": "cosine",
+        "n_timestep": 1000
+      }
+    },
+    "init_type": "kaiming",
+    "unet": {
+      "channel_multiplier": [
+        32,64,128,256
+      ]
+    },
+    "diffusion": {
+      "loss_type": "l1"
+    }
+  },
+  "train": {
+    "val_freq": 2000,
+    "save_checkpoint_freq": 2000,
+    "print_freq": 50,
+    "max_iter": 150000,
+    "optimizer": {
+      "lr": 1e-4
+    }
+  }
+}
+
+
+

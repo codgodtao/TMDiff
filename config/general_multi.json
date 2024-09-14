@@ -1,0 +1,90 @@
+{
+  "name": "modulated_model_ablation_batch_8_finetune",
+  "info": "32 16 8 4",
+  "phase": "train",
+  "distributed": true,
+  "gpu_ids": [
+    0
+  ],
+  "path": {
+    //set the path
+    "log": "logs",
+    "tb_logger": "tb_logger",
+    "results": "results",
+    "checkpoint": "checkpoint",
+    "resume": "/home/qlt/EM_sharpening/experiments/modulated_model_ablation_batch_8_9648/checkpoint/I180000"
+  },
+  "datasets": {
+    "train_qb": {
+      "dataroot": "/data/qlt/pancollection/training_data/train_qb_data.h5",
+      "batch_size": 8,
+      "num_workers": 8,
+      "use_shuffle": true,
+      "data_len": -1
+    },
+    "train_gf2": {
+      "dataroot": "/data/qlt/pancollection/training_data/train_gf2_data.h5",
+      "batch_size": 8,
+      "num_workers": 8,
+      "use_shuffle": true,
+      "data_len": -1
+    },
+    "train_wv3": {
+      "dataroot": "/data/qlt/pancollection/training_data/train_wv3_data.h5",
+      "batch_size": 8,
+      "num_workers": 8,
+      "use_shuffle": true,
+      "data_len": -1
+    },
+    "val_QB": {
+      "dataroot": "/data/qlt/pancollection/test_data/QB/test_qb_data_RR.h5",
+      "data_len": -1
+    },
+    "val_GF2": {
+      "dataroot": "/data/qlt/pancollection/test_data/GF2/test_gf2_data_RR.h5",
+      "data_len": -1
+    },
+    "val_WV3": {
+      "dataroot": "/data/qlt/pancollection/test_data/WV3/test_wv3_data_RR.h5",
+      "data_len": -1
+    }
+  },
+  "model": {
+    "beta_schedule": {
+      "train": {
+        "schedule": "cosine",
+        "n_timestep": 1000
+      },
+      "val": {
+        "schedule": "cosine",
+        "n_timestep": 1000
+      }
+    },
+    "init_type": "kaiming",
+    "unet": {
+      "channel_multiplier": [
+        32,
+        64,
+        128,
+        256
+      ]
+    },
+    "diffusion": {
+      "loss_type": "l1"
+    }
+  },
+  "train": {
+    "val_freq": 5000,
+    "save_checkpoint_freq": 5000,
+    "print_freq": 50,
+    "max_iter": 300000,
+    "optimizer": {
+      "lr": 1e-4,
+      "step_size": 150000,
+      "gamma": 0.2
+    }
+  }
+}
+
+
+
